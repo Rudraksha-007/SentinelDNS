@@ -1,3 +1,4 @@
+#define _WIN32_WINNT 0x0600
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iostream>
@@ -17,8 +18,42 @@ struct DNSHeader {
     uint16_t arcount;  // Number of additional RRs
 };
 
+struct DNSAnswer {
+    uint16_t type;     // Type of record (A, CNAME, etc.)
+    uint16_t class_;   // Class of record (IN for Internet)
+    uint32_t ttl;      // Time to live
+    uint16_t rdlength; // Length of RDATA
+    unsigned char* rdata; // Resource data (IP address, etc.)
+};
+
+struct DNSRecord {
+    std::string domain;
+    struct in_addr ip;
+};
+
+bool ipStringToBytes(const char* ipStr, unsigned char out[4]) {
+    unsigned int b1, b2, b3, b4;
+    if (sscanf(ipStr, "%u.%u.%u.%u", &b1, &b2, &b3, &b4) != 4)
+        return false;
+    if (b1 > 255 || b2 > 255 || b3 > 255 || b4 > 255)
+        return false;
+    out[0] = (unsigned char)b1;
+    out[1] = (unsigned char)b2;
+    out[2] = (unsigned char)b3;
+    out[3] = (unsigned char)b4;
+    return true;
+}
 
 int main() {
+    std::vector<DNSRecord> records = {
+        {"example.com", {}},
+        {"test.com", {}}
+    };
+    // InetPtonA(AF_INET, "93.184.216.34", &records[0].ip);
+    unsigned char ipBytes[4];
+    ipStringToBytes("93.184.216.34", ipBytes);
+    records[0].ip.s_addr = *(uint32_t*)ipBytes; // Convert to network byte order
+    
     WSADATA wsaData;
     SOCKET sock;
     sockaddr_in serverAddr, clientAddr;
@@ -84,22 +119,29 @@ int main() {
         }
         
         std::cout << "Got DNS query of size " << bytesReceived << " bytes\n";
-        // might break the terminal:
-        // std::cout<<"Buffer content: "<<std::endl;
-        // for(auto ch:buffer){
-        //     std::cout<<(int)ch<<" ";
-        // }
-        // std::cout<<std::endl;
-
         // TODO: Parse domain from buffer here (RFC1035)
-        // parsing header : 
-        DNSHeader* dns = (DNSHeader*)buffer;
-        uint16_t qdcount = ntohs(dns->qdcount); 
+        
+        DNSHeader dns;
+        memcpy(&dns, buffer, sizeof(DNSHeader));
+
+        uint16_t id = ntohs(dns.id); 
+        uint16_t flags = ntohs(dns.flags); 
+        uint16_t qdcount = ntohs(dns.qdcount); 
+        
+        // check if the query is authoritative or recursive
+        // if((flags & 0x0100) != 0){
+        //     std::cout << "Recursion desired for query ID: " << id << "\n";
+        //     continue;
+        // }
+        // else{
+        //     std::cout << "Recursion not desired for query ID: " << id << "\n";
+        //     std::cout<<"Proceeding with auth. query processing\n";
+        // }
 
         // this ptr is pointing inside the buffer itself exactly after the DNSHeader(skipping initial 12bytes)
         unsigned char* ptr = (unsigned char*)(buffer + sizeof(DNSHeader));
-
         std::string domain;
+
         while (*ptr != 0) {
             int label_len = *ptr;
             ptr++;
@@ -138,9 +180,72 @@ int main() {
         std::cout << "QTYPE: " << qtype << " QCLASS: " << qclass << "\n";
         
         // TODO: Build response packet and send back
+        char response[BUF_SIZE];
+        int response_len = 0;
+
+        // building the DNS response header:
+        DNSHeader* response_header = (DNSHeader*)response;
+        response_header->id = dns.id; // ID is already in network byte order from request
+        response_header->flags = htons(0x8180); // Standard response flags
+        response_header->qdcount = dns.qdcount; // Question count is same as request
+        response_header->ancount = htons(0); // We'll add answers later
+        response_header->nscount = htons(0);
+        response_header->arcount = htons(0);
+        response_len += sizeof(DNSHeader);
         
-        // For now just echo back the same bytes (not valid DNS!)
-        sendto(sock, buffer, bytesReceived, 0,
+        // The question section from the query is copied directly to the response.
+        // It starts right after the header and ends where your 'ptr' is.
+        char* question_start_in_query = buffer + sizeof(DNSHeader);
+        int question_len = (char*)ptr - question_start_in_query;
+
+        memcpy(response + response_len, question_start_in_query, question_len);
+        response_len += question_len;
+        
+        // TODO: Build the answer section here
+        bool found=false;
+        char *answer_ptr=response+response_len;
+        // The answer section starts after the question section
+        
+        for(auto record:records){
+            if(domain==record.domain){
+                // 1. NAME: Add the 2-byte pointer (0xc00c)
+                *(uint16_t*)answer_ptr = htons(0xc00c);
+                answer_ptr += 2;
+
+                // 2. TYPE: A Record (1)
+                *(uint16_t*)answer_ptr = htons(1);
+                answer_ptr += 2;
+
+                // 3. CLASS: IN (1)
+                *(uint16_t*)answer_ptr = htons(1);
+                answer_ptr += 2;
+
+                // 4. TTL: 3600 seconds
+                *(uint32_t*)answer_ptr = htonl(3600);
+                answer_ptr += 4;
+
+                // 5. RDLENGTH: 4 bytes for an IPv4 address
+                *(uint16_t*)answer_ptr = htons(4);
+                answer_ptr += 2;
+
+                // 6. RDATA: The IP address
+                // record.ip.s_addr is already in network byte order
+                *(uint32_t*)answer_ptr = record.ip.s_addr;
+                answer_ptr += 4;
+
+                // Update total response length
+                response_len = answer_ptr - response;
+
+                // Update the answer count in the header
+                response_header->ancount = htons(ntohs(response_header->ancount) + 1);
+                
+                found = true;
+                break; // Found our record, stop searching
+            }
+        }
+
+        // For now, just send back the header and question section
+        sendto(sock, response, response_len, 0,
                (sockaddr*)&clientAddr, clientAddrLen);
     }
 
